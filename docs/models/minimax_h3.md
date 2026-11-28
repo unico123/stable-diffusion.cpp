@@ -133,6 +133,7 @@ Select optional components when required by your checkpoint or task.
 | [Reference to audio/video](../dgl/minimax_h3/minimax-h3-reference-to-av.dgl) | Use image, video and audio references. |
 | [Interpolated latent hires](../dgl/minimax_h3/minimax-h3-latent-hires.dgl) | Resize the draft latent, then run a second sampling pass. |
 | [Learned latent hires](../dgl/minimax_h3/minimax-h3-learned-hires.dgl) | Use a learned latent upscaler between sampling passes. |
+| [Audio/video continuation](../dgl/minimax_h3/minimax-h3-av-continuation.dgl) | Generate and join two clips with shared audio and video context. |
 
 #### Run a script
 
@@ -155,6 +156,20 @@ Choose another script from the table to run a different task. Add `--check`
 to validate syntax and types without loading weights. See the
 [shared run instructions](../dgl/README.md#run-an-example) for build paths
 and the server's file-access rules.
+
+#### Audio/video continuation
+
+The continuation example saves the finished video as `continuation-joined.avi`
+at 24 fps. It also writes `continuation-part-a.avi`,
+`continuation-part-b.avi` with its overlap removed, and `continuation-part-a.npy`
+with A's latent.
+
+Set `overlap_frames` to the maximum overlap you want. The script rounds down
+to a supported overlap and leaves at least half of B for new content. Set it
+to zero to generate two independent clips and join them.
+
+The video and audio VAEs use the default device. Set `vae_backend` to a device
+reported by `sd-cli --list-devices` to run both decoders on that device.
 
 #### Latent upscaling
 
