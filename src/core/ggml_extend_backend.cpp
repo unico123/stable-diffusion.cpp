@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -357,6 +358,16 @@ bool sd_backend_is(ggml_backend_t backend, const std::string& name) {
     return lower_copy(dev_name).find(lower_copy(name)) != std::string::npos;
 }
 
+bool sd_backend_is_cuda_family(ggml_backend_t backend) {
+    const auto dev = backend != nullptr ? ggml_backend_get_device(backend) : nullptr;
+    const auto reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg == nullptr) {
+        return false;
+    }
+    const char* name = ggml_backend_reg_name(reg);
+    return std::strcmp(name, "CUDA") == 0 || std::strcmp(name, "ROCm") == 0 || std::strcmp(name, "MUSA") == 0;
+}
+
 static std::string get_default_backend_name() {
     ggml_backend_load_all_once();
     // should pick the same backend preference as ggml_backend_init_best
@@ -638,6 +649,39 @@ void sd_backend_clear_buffer_cache(ggml_backend_t backend) {
     }
 }
 
+bool sd_backend_get_buffer_cache_memory(ggml_backend_dev_t device, size_t& free_bytes, size_t& total_bytes, size_t& cached_bytes) {
+    auto reg                   = ggml_backend_dev_backend_reg(device);
+    using GetBufferCacheMemory = void (*)(ggml_backend_dev_t, size_t*, size_t*, size_t*);
+    auto fn                    = reinterpret_cast<GetBufferCacheMemory>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_buffer_cache_memory"));
+    if (fn == nullptr) {
+        ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+        cached_bytes = 0;
+        return false;
+    }
+    fn(device, &free_bytes, &total_bytes, &cached_bytes);
+    return true;
+}
+
+void sd_backend_set_buffer_cache_limit(ggml_backend_dev_t device, size_t bytes) {
+    auto reg                  = ggml_backend_dev_backend_reg(device);
+    using SetBufferCacheLimit = void (*)(ggml_backend_dev_t, size_t);
+    auto fn                   = reinterpret_cast<SetBufferCacheLimit>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_buffer_cache_limit"));
+    if (fn != nullptr) {
+        fn(device, bytes);
+    }
+}
+
+ggml_backend_buffer_t sd_backend_try_alloc_buffer_from_cache(ggml_backend_buffer_type_t buft, size_t bytes) {
+    auto device = ggml_backend_buft_get_device(buft);
+    if (device == nullptr) {
+        return nullptr;
+    }
+    auto reg                      = ggml_backend_dev_backend_reg(device);
+    using TryAllocBufferFromCache = ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t, size_t);
+    auto fn                       = reinterpret_cast<TryAllocBufferFromCache>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_try_alloc_buffer_from_cache"));
+    return fn != nullptr ? fn(buft, bytes) : nullptr;
+}
+
 const char* sd_get_system_info() {
     static std::string cache_info = []() -> std::string {
         ggml_backend_load_all_once();
@@ -837,6 +881,25 @@ bool sd_parse_flash_attention_assignment(const std::string& spec, SDBackendAssig
 
 bool sd_parse_conv_direct_assignment(const std::string& spec, SDBackendAssignment* assignment, std::string* error) {
     return parse_operation_assignment(spec, assignment, error, true);
+}
+
+bool sd_parse_linear_type_assignment(const std::string& spec, SDBackendAssignment* assignment, std::string* error) {
+    if (!sd_parse_backend_assignment(spec, assignment, error)) {
+        return false;
+    }
+    const auto valid_mode = [](const std::string& mode) {
+        return mode == "auto" || mode == "i8" || mode == "raw";
+    };
+    if (assignment->empty() ||
+        (!assignment->default_name.empty() && !valid_mode(assignment->default_name)) ||
+        !std::all_of(assignment->module_names.begin(), assignment->module_names.end(),
+                     [&](const auto& entry) { return valid_mode(entry.second); })) {
+        if (error) {
+            *error = "linear_type expects auto, i8, raw, or module assignments such as dit=i8";
+        }
+        return false;
+    }
+    return true;
 }
 
 bool SDBackendAssignment::empty() const {

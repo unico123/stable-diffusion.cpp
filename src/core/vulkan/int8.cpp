@@ -21,10 +21,33 @@
 #include "quantize_i8_convrot_h64.h"
 #include "quantize_i8_convrot_register.h"
 #include "quantize_i8_convrot_subgroup.h"
+#include "quantize_i8_rowwise.h"
+#include "quantize_i8_rowwise_subgroup.h"
+#include "requantize_q2_k.h"
+#include "requantize_q2_k_subgroup.h"
+#include "requantize_q3_k.h"
+#include "requantize_q3_k_subgroup.h"
+#include "requantize_q4_0.h"
+#include "requantize_q4_1.h"
+#include "requantize_q4_k.h"
+#include "requantize_q4_k_subgroup.h"
+#include "requantize_q5_0.h"
+#include "requantize_q5_1.h"
+#include "requantize_q5_k.h"
+#include "requantize_q5_k_subgroup.h"
+#include "requantize_q6_k.h"
+#include "requantize_q6_k_subgroup.h"
+#include "requantize_q8.h"
+#include "requantize_q8_k.h"
+#include "requantize_q8_register.h"
+#include "requantize_q8_subgroup.h"
 #include "rms_modulate_convrot.h"
 #include "sigmoid_quantize_i8_convrot_6144.h"
+#include "sigmoid_quantize_i8_rowwise_6144.h"
 #include "swiglu_quantize_i8_convrot.h"
 #include "swiglu_quantize_i8_convrot_16384.h"
+#include "swiglu_quantize_i8_rowwise.h"
+#include "swiglu_quantize_i8_rowwise_16384.h"
 
 namespace sd_vulkan_i8 {
     // Keep these budgets in sync with the cooperative matrix shader tile layouts.
@@ -106,11 +129,14 @@ namespace sd_vulkan_i8 {
     static bool can_modulate(const Device& d, int64_t k, bool affine) {
         return (k == 4096 || k == 6144 || (affine && k == 5376)) && d.info.max_group_invocations >= 512 && d.info.max_group_size[0] >= 512 && d.compute.shared_memory >= (k + 1024) * 4;
     }
-    static bool can_quantize(const Device& d, const ggml_tensor* dst) {
+    static bool can_quantize(const Device& d, const ggml_tensor* dst, bool allow_unrotated = false) {
         int group;
-        if (!sd_ggml_convrot_describe(dst, &group) || group != 256 || !bounded(d, dst) || !bounded(d, dst->src[0]))
+        if (!sd_ggml_convrot_describe(dst, &group) || (group != 256 && !(allow_unrotated && group == 1)) ||
+            !bounded(d, dst) || !bounded(d, dst->src[0]))
             return false;
         const auto* x = dst->src[0];
+        if (group == 1 && (x->ne[0] % 256 || (uint64_t(x->ne[0]) * GGML_PAD(ggml_nrows(x), 4)) % d.info.buffer_alignment))
+            return false;
         return x->ne[0] <= UINT32_MAX && ggml_nrows(x) <= UINT32_MAX && d.info.max_group_invocations >= 256 && d.info.max_group_size[0] >= 256;
     }
     static uint64_t w4a8_chunk_cols(const Device& d, const SDI8Operation& op) {
@@ -170,7 +196,7 @@ namespace sd_vulkan_i8 {
             mul->op != GGML_OP_MUL || mul->src[1] != sigmoid ||
             !is_convrot(quant) || quant->src[0] != mul ||
             sigmoid->ne[0] != 6144 || !ggml_are_same_shape(sigmoid, mul->src[0]) ||
-            !can_quantize(device, quant)) {
+            !can_quantize(device, quant, true)) {
             return false;
         }
         for (const ggml_tensor* tensor : {sigmoid->src[0], mul->src[0]}) {
@@ -191,7 +217,7 @@ namespace sd_vulkan_i8 {
         if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
             glu->src[1] == nullptr || param_i32(glu, 1) != 0 ||
             !is_convrot(quant) || quant->src[0] != glu ||
-            !can_quantize(device, quant) || !ggml_is_contiguous(glu->src[0]) || !ggml_is_contiguous(glu->src[1])) {
+            !can_quantize(device, quant, true) || !ggml_is_contiguous(glu->src[0]) || !ggml_is_contiguous(glu->src[1])) {
             return false;
         }
         for (const ggml_tensor* tensor : {glu->src[0], glu->src[1]}) {
@@ -207,7 +233,7 @@ namespace sd_vulkan_i8 {
             return 0;
         }
         const ggml_tensor* quant = node(graph, quant_idx);
-        if (!is_convrot(quant) || !can_quantize(device, quant)) {
+        if (!is_convrot(quant) || !can_quantize(device, quant, true)) {
             return 0;
         }
         const ggml_tensor* nodes[4]{};
@@ -482,6 +508,9 @@ namespace sd_vulkan_i8 {
     struct QuantParameters {
         uint32_t k, rows;
     };
+    struct PackParameters {
+        uint32_t words_per_row, rows, scale_offset;
+    };
     struct ModulateParameters {
         uint32_t rows, x_offset, m_offset, h_offset;
         float eps;
@@ -492,7 +521,9 @@ namespace sd_vulkan_i8 {
         float output_scale;
         uint32_t group_cols, output_stride, output_col;
     };
-    static_assert(sizeof(QuantParameters) == 8 && sizeof(ModulateParameters) == 28 && sizeof(MatParameters) == 36, "INT8 push constant layout mismatch");
+    static_assert(sizeof(QuantParameters) == 8 && sizeof(PackParameters) == 12 &&
+                      sizeof(ModulateParameters) == 28 && sizeof(MatParameters) == 36,
+                  "INT8 push constant layout mismatch");
     template <size_t N>
     static ggml_ext_vulkan_pipeline shader(const char* name, const uint32_t (&spirv)[N], uint32_t bindings, uint32_t constants) {
         return {name, spirv, sizeof(spirv), bindings, constants, nullptr, 0, 0, false};
@@ -531,7 +562,81 @@ namespace sd_vulkan_i8 {
         }
         return status;
     }
-    static ggml_status quantize(const ggml_ext_execution_context* e, const Device& d, ggml_tensor* const* nodes, int count) {
+    static ggml_status pack_rows(const ggml_ext_execution_context* e, const Device& d, const ggml_tensor* output) {
+        const auto* input       = output->src[0];
+        const bool requantize   = ggml_is_quantized(input->type);
+        const bool q8           = input->type == GGML_TYPE_Q8_0;
+        const uint32_t words    = uint32_t(input->ne[0] / 4);
+        const uint32_t rows     = uint32_t(ggml_nrows(input));
+        const PackParameters pc = {words, rows, words * (requantize ? rows : GGML_PAD(rows, 4))};
+        ggml_ext_vulkan_binding dst;
+        bool alias;
+        if (!output_binding(e, d, output, {{input}}, dst, alias))
+            return GGML_STATUS_FAILED;
+        const ggml_ext_vulkan_binding bindings[] = {{input}, dst};
+        const uint32_t groups[]                  = {std::min(rows, d.info.max_group_count[0]), 1, 1};
+        constexpr uint32_t words_per_round       = 8 * 64;
+        constexpr uint32_t max_cached_groups     = 8;
+        const bool subgroup_rotation             = d.subgroup && d.info.max_group_size[0] >= 256;
+        const bool q8_subgroup                   = q8 && d.info.float16;
+        const bool k_subgroup                    = subgroup_rotation && words >= words_per_round && input->type != GGML_TYPE_Q8_K &&
+                                                   sd_ggml_requantize_i8_block(input->type).size == 256;
+        const uint32_t cached_groups             = words <= 2 * words_per_round ? 2 : words <= 4 * words_per_round ? 4
+                                                                                                                   : max_cached_groups;
+        const bool retain                        = subgroup_rotation && q8_subgroup && words <= max_cached_groups * words_per_round;
+        auto pipeline                            = SD_VK_PIPELINE(quantize_i8_rowwise, 2, PackParameters);
+        switch (input->type) {
+            case GGML_TYPE_Q4_0:
+                pipeline = SD_VK_PIPELINE(requantize_q4_0, 2, PackParameters);
+                break;
+            case GGML_TYPE_Q4_1:
+                pipeline = SD_VK_PIPELINE(requantize_q4_1, 2, PackParameters);
+                break;
+            case GGML_TYPE_Q5_0:
+                pipeline = SD_VK_PIPELINE(requantize_q5_0, 2, PackParameters);
+                break;
+            case GGML_TYPE_Q5_1:
+                pipeline = SD_VK_PIPELINE(requantize_q5_1, 2, PackParameters);
+                break;
+            case GGML_TYPE_Q8_0:
+                pipeline = retain ? SD_VK_PIPELINE(requantize_q8_register, 2, PackParameters) : SD_VK_PIPELINE(requantize_q8, 2, PackParameters);
+                break;
+            case GGML_TYPE_Q2_K:
+                pipeline = k_subgroup ? SD_VK_PIPELINE(requantize_q2_k_subgroup, 2, PackParameters) : SD_VK_PIPELINE(requantize_q2_k, 2, PackParameters);
+                break;
+            case GGML_TYPE_Q3_K:
+                pipeline = k_subgroup ? SD_VK_PIPELINE(requantize_q3_k_subgroup, 2, PackParameters) : SD_VK_PIPELINE(requantize_q3_k, 2, PackParameters);
+                break;
+            case GGML_TYPE_Q4_K:
+                pipeline = k_subgroup ? SD_VK_PIPELINE(requantize_q4_k_subgroup, 2, PackParameters) : SD_VK_PIPELINE(requantize_q4_k, 2, PackParameters);
+                break;
+            case GGML_TYPE_Q5_K:
+                pipeline = k_subgroup ? SD_VK_PIPELINE(requantize_q5_k_subgroup, 2, PackParameters) : SD_VK_PIPELINE(requantize_q5_k, 2, PackParameters);
+                break;
+            case GGML_TYPE_Q6_K:
+                pipeline = k_subgroup ? SD_VK_PIPELINE(requantize_q6_k_subgroup, 2, PackParameters) : SD_VK_PIPELINE(requantize_q6_k, 2, PackParameters);
+                break;
+            case GGML_TYPE_Q8_K:
+                pipeline = SD_VK_PIPELINE(requantize_q8_k, 2, PackParameters);
+                break;
+            case GGML_TYPE_F32:
+                break;
+            default:
+                return GGML_STATUS_FAILED;
+        }
+        if (d.subgroup && (k_subgroup || !requantize || q8_subgroup)) {
+            if (retain) {
+                pipeline.constants      = &cached_groups;
+                pipeline.constant_count = 1;
+            } else if (!k_subgroup) {
+                pipeline = q8 ? SD_VK_PIPELINE(requantize_q8_subgroup, 2, PackParameters) : SD_VK_PIPELINE(quantize_i8_rowwise_subgroup, 2, PackParameters);
+            }
+            pipeline.full_subgroups         = d.info.full_subgroups;
+            pipeline.required_subgroup_size = d.info.subgroup_size_control ? 32 : 0;
+        }
+        return finish(e, d, output, dst, alias, d.api->dispatch(e->backend, &pipeline, bindings, &pc, groups));
+    }
+    static ggml_status quantize(const ggml_ext_execution_context* e, const Device& d, ggml_tensor* const* nodes, int count, int group) {
         const auto* output                          = nodes[count - 1];
         const auto* first                           = nodes[0];
         const bool modulate                         = count > 1 && (first->op == GGML_OP_NORM || sd_ggml_modulate_describe(first) || first->op == GGML_OP_RMS_NORM);
@@ -578,18 +683,15 @@ namespace sd_vulkan_i8 {
                     *offsets[i] = info.shader_offset / 4;
                 }
             auto pipeline              = rms ? SD_VK_PIPELINE(rms_modulate_convrot, 6, ModulateParameters) : SD_VK_PIPELINE(modulate_convrot, 5, ModulateParameters);
-            const uint32_t constants[] = {k, uint32_t(affine), uint32_t(shift != nullptr)};
+            const uint32_t constants[] = {k, uint32_t(affine), uint32_t(shift != nullptr), uint32_t(group == 256)};
             pipeline.constants         = constants;
-            pipeline.constant_count    = 3;
+            pipeline.constant_count    = 4;
             status                     = d.api->dispatch(e->backend, &pipeline, bindings.data(), &pc, groups);
         } else {
             ggml_ext_vulkan_binding bindings[] = {{x}, packed, scales, {up}};
-            int group;
-            if (!sd_ggml_convrot_describe(output, &group))
-                return GGML_STATUS_FAILED;
-            auto pipeline  = group == 64 ? SD_VK_PIPELINE(quantize_i8_convrot_h64, 3, QuantParameters) : SD_VK_PIPELINE(quantize_i8_convrot, 3, QuantParameters);
-            bool subgroup  = group == 256 && d.subgroup && k >= 1024;
-            uint32_t width = k;
+            auto pipeline                      = group == 64 ? SD_VK_PIPELINE(quantize_i8_convrot_h64, 3, QuantParameters) : SD_VK_PIPELINE(quantize_i8_convrot, 3, QuantParameters);
+            bool subgroup                      = group == 256 && d.subgroup && k >= 1024;
+            uint32_t width                     = k;
             if (subgroup) {
                 pipeline = SD_VK_PIPELINE(quantize_i8_convrot_subgroup, 3, QuantParameters);
                 if (!up && ((uint64_t(k) + 2047) / 2048) * 8 <= 64) {
@@ -600,9 +702,15 @@ namespace sd_vulkan_i8 {
             }
             if (up) {
                 subgroup = true;
-                pipeline = k == 16384 ? SD_VK_PIPELINE(swiglu_quantize_i8_convrot_16384, 4, QuantParameters) : SD_VK_PIPELINE(swiglu_quantize_i8_convrot, 4, QuantParameters);
-                if (sigmoid)
-                    pipeline = SD_VK_PIPELINE(sigmoid_quantize_i8_convrot_6144, 4, QuantParameters);
+                if (group == 1) {
+                    pipeline = k == 16384 ? SD_VK_PIPELINE(swiglu_quantize_i8_rowwise_16384, 4, QuantParameters) : SD_VK_PIPELINE(swiglu_quantize_i8_rowwise, 4, QuantParameters);
+                    if (sigmoid)
+                        pipeline = SD_VK_PIPELINE(sigmoid_quantize_i8_rowwise_6144, 4, QuantParameters);
+                } else {
+                    pipeline = k == 16384 ? SD_VK_PIPELINE(swiglu_quantize_i8_convrot_16384, 4, QuantParameters) : SD_VK_PIPELINE(swiglu_quantize_i8_convrot, 4, QuantParameters);
+                    if (sigmoid)
+                        pipeline = SD_VK_PIPELINE(sigmoid_quantize_i8_convrot_6144, 4, QuantParameters);
+                }
             }
             if (subgroup) {
                 pipeline.full_subgroups         = d.info.full_subgroups;
@@ -670,17 +778,17 @@ namespace sd_vulkan_i8 {
         if (op.codebook && alias)
             dst.offset = GGML_PAD(size_t(chunk_cols) * k, d.info.buffer_alignment);
 
-        const auto destination = concat ? range(dst, ggml_nbytes(concat->src[0]), ggml_nbytes(tail)) : dst;
-        const uint32_t output_stride = uint32_t(tail->ne[0]);
+        const auto destination             = concat ? range(dst, ggml_nbytes(concat->src[0]), ggml_nbytes(tail)) : dst;
+        const uint32_t output_stride       = uint32_t(tail->ne[0]);
         ggml_ext_vulkan_binding bindings[] = {{op.weight}, {op.input, nullptr, 0, scale_offset}, {op.weight_scale}, {op.input, nullptr, scale_offset, size_t(rows) * 4}, {op.bias ? op.bias : op.weight_scale}, destination, {up_mat ? up.weight : gate}, {up_mat ? up.weight_scale : residual}};
-        auto multiply_chunk = [&](uint32_t first, uint32_t cols) {
+        auto multiply_chunk                = [&](uint32_t first, uint32_t cols) {
             const uint32_t output_cols = glu ? uint32_t(glu->ne[0]) : cols;
-            auto dispatch = [&](ggml_ext_vulkan_pipeline pipeline, uint32_t tile_cols, uint32_t tile_rows,
-                                std::initializer_list<uint32_t> constants, uint32_t row_offset, uint32_t dispatch_rows) {
+            auto dispatch              = [&](ggml_ext_vulkan_pipeline pipeline, uint32_t tile_cols, uint32_t tile_rows,
+                                             std::initializer_list<uint32_t> constants, uint32_t row_offset, uint32_t dispatch_rows) {
                 if (!dispatch_rows)
                     return GGML_STATUS_SUCCESS;
-                MatParameters pc = {cols * (up_mat ? 2u : 1u), rows, k, op.bias ? 1u : 0u, row_offset, output_scale,
-                                    group_columns(output_cols, k, tile_cols, glu != nullptr), output_stride, first};
+                MatParameters pc        = {cols * (up_mat ? 2u : 1u), rows, k, op.bias ? 1u : 0u, row_offset, output_scale,
+                                           group_columns(output_cols, k, tile_cols, glu != nullptr), output_stride, first};
                 pipeline.constants      = constants.begin();
                 pipeline.constant_count = uint32_t(constants.size());
                 const uint32_t groups[] = {(output_cols + tile_cols - 1) / tile_cols, (dispatch_rows + tile_rows - 1) / tile_rows, 1};
@@ -688,15 +796,15 @@ namespace sd_vulkan_i8 {
             };
             ggml_status status = GGML_STATUS_SUCCESS;
             if (d.cm2) {
-                const bool large_k       = k % 4096 == 0 || (rows >= cols && k >= cols);
+                const bool large_k = k % 4096 == 0 || (rows >= cols && k >= cols);
                 // The aligned store uses a row stride rounded down to 128 columns.
                 const bool aligned_output = cols % 128 == 0 && output_stride % 128 == 0;
-                const uint32_t full_rows = (glu || aligned_output) ? rows / 128 * 128 : 0;
-                auto pipeline            = residual ? SD_VK_PIPELINE(mul_mat_i8_residual_cm2, 8, MatParameters) : up_mat ? SD_VK_PIPELINE(mul_mat_i8_swiglu_split_cm2, 8, MatParameters)
-                                                                                                                         : SD_VK_PIPELINE(mul_mat_i8_tensorwise_cm2, 6, MatParameters);
-                const uint32_t tile_cols = glu ? 64 : 128;
-                const uint32_t full_k    = (glu || large_k) && k % 128 == 0 ? 128u : 64u;
-                status                   = dispatch(pipeline, tile_cols, 128, {128, 1, glu ? 1u : 0u, tile_cols, full_k}, 0, full_rows);
+                const uint32_t full_rows  = (glu || aligned_output) ? rows / 128 * 128 : 0;
+                auto pipeline             = residual ? SD_VK_PIPELINE(mul_mat_i8_residual_cm2, 8, MatParameters) : up_mat ? SD_VK_PIPELINE(mul_mat_i8_swiglu_split_cm2, 8, MatParameters)
+                                                                                                                          : SD_VK_PIPELINE(mul_mat_i8_tensorwise_cm2, 6, MatParameters);
+                const uint32_t tile_cols  = glu ? 64 : 128;
+                const uint32_t full_k     = (glu || large_k) && k % 128 == 0 ? 128u : 64u;
+                status                    = dispatch(pipeline, tile_cols, 128, {128, 1, glu ? 1u : 0u, tile_cols, full_k}, 0, full_rows);
                 if (status == GGML_STATUS_SUCCESS) {
                     const bool small         = d.cm2_small && (glu || aligned_output) && rows - full_rows <= 32;
                     const uint32_t tail_cols = small || glu ? 64 : 128, tail_rows = small ? 32 : glu ? 128
@@ -725,9 +833,9 @@ namespace sd_vulkan_i8 {
             const uint32_t cols = std::min(chunk_cols, n - first);
             if (op.codebook) {
                 const size_t packed_row = op.weight->nb[1], scale_row = op.relative_scale->nb[1];
-                bindings[0] = {nullptr, e->workspace, 0, size_t(cols) * k};
-                bindings[2] = range({op.weight_scale}, size_t(first) * sizeof(float), size_t(cols) * sizeof(float));
-                bindings[4] = op.bias ? range({op.bias}, size_t(first) * sizeof(float), size_t(cols) * sizeof(float)) : bindings[2];
+                bindings[0]                                   = {nullptr, e->workspace, 0, size_t(cols) * k};
+                bindings[2]                                   = range({op.weight_scale}, size_t(first) * sizeof(float), size_t(cols) * sizeof(float));
+                bindings[4]                                   = op.bias ? range({op.bias}, size_t(first) * sizeof(float), size_t(cols) * sizeof(float)) : bindings[2];
                 const ggml_ext_vulkan_binding decode_inputs[] = {
                     range({op.weight}, first * packed_row, cols * packed_row),
                     {op.codebook},
@@ -735,9 +843,9 @@ namespace sd_vulkan_i8 {
                     bindings[0],
                 };
                 const uint32_t groups_count = cols * (k / 16);
-                const uint32_t groups[] = {std::min((groups_count + 127) / 128, d.info.max_group_count[0]), 1, 1};
-                const auto pipeline = SD_VK_PIPELINE(decode_w4a8, 4, uint32_t);
-                const auto status = d.api->dispatch(e->backend, &pipeline, decode_inputs, &groups_count, groups);
+                const uint32_t groups[]     = {std::min((groups_count + 127) / 128, d.info.max_group_count[0]), 1, 1};
+                const auto pipeline         = SD_VK_PIPELINE(decode_w4a8, 4, uint32_t);
+                const auto status           = d.api->dispatch(e->backend, &pipeline, decode_inputs, &groups_count, groups);
                 if (status != GGML_STATUS_SUCCESS)
                     return status;
             }
@@ -810,6 +918,30 @@ namespace sd_vulkan_i8 {
         const uint32_t groups[] = {(n + tile_cols - 1) / tile_cols, (rows + tile_rows - 1) / tile_rows, 1};
         auto status             = d.api->dispatch(e->backend, &pipeline, bindings.data(), &pc, groups);
         return finish(e, d, output, dst, alias, status);
+    }
+    static bool can_pack_rows(const Device& d, const ggml_tensor* n) {
+        constexpr uint32_t threads = 128;
+        const auto* input          = n->src[0];
+        const size_t alignment     = ggml_is_quantized(input->type) ? sizeof(uint32_t) : 4 * sizeof(float);
+        return bounded(d, n) && bounded(d, input) &&
+               aligned(n, sizeof(uint32_t)) && aligned(input, alignment) &&
+               ggml_nbytes(n) <= UINT32_MAX && ggml_nbytes(input) <= UINT32_MAX &&
+               d.info.max_group_invocations >= threads && d.info.max_group_size[0] >= threads &&
+               d.info.max_push_constants >= sizeof(PackParameters) && d.compute.shared_memory >= threads * sizeof(float);
+    }
+    static bool requantize_supports(ggml_backend_dev_t dev, const ggml_tensor* n, void*) {
+        Device d;
+        const auto k                       = n->src[0]->ne[0];
+        constexpr uint32_t rotation_bytes  = 2 * 128 * 4 * sizeof(float);
+        constexpr uint32_t reduction_bytes = 128 * sizeof(float);
+        return k % 256 == 0 && k <= INT_MAX / 16384 &&
+               device_info(dev, d) && d.compute.shared_memory >= rotation_bytes + reduction_bytes && can_pack_rows(d, n);
+    }
+    static bool quant1_supports(ggml_backend_dev_t dev, const ggml_tensor* n, void*) {
+        Device d;
+        int group;
+        return sd_ggml_convrot_describe(n, &group) && group == 1 && n->ne[0] % 4 == 0 &&
+               device_info(dev, d) && can_pack_rows(d, n);
     }
     static bool quant64_supports(ggml_backend_dev_t dev, const ggml_tensor* n, void*) {
         Device d;
@@ -922,7 +1054,12 @@ namespace sd_vulkan_i8 {
             return GGML_STATUS_FAILED;
         if (ggml_ext_op_get(nodes[0]) == sd_ggml_w4_op())
             return multiply_w4(e, d, nodes[0]);
-        return is_convrot(nodes[count - 1]) ? quantize(e, d, nodes, count) : multiply(e, d, nodes, count);
+        if (ggml_ext_op_get(nodes[0]) == sd_ggml_requantize_i8_op())
+            return pack_rows(e, d, nodes[0]);
+        int group;
+        if (sd_ggml_convrot_describe(nodes[count - 1], &group))
+            return group == 1 && count == 1 ? pack_rows(e, d, nodes[0]) : quantize(e, d, nodes, count, group);
+        return multiply(e, d, nodes, count);
     }
 
     struct LoRAMergeParams {
@@ -985,6 +1122,10 @@ void sd_ggml_register_vulkan_i8(ggml_backend_dev_t device) {
     d.prepare   = prepare;
     d.destroy   = destroy;
     d.execute   = execute;
+    d.name      = "sd.requantize_i8.vulkan.v1";
+    d.custom_op = sd_ggml_requantize_i8_op();
+    d.supports  = requantize_supports;
+    GGML_ASSERT(ggml_ext_register_kernel(device, &d));
     d.name      = "sd.quantize_i8_convrot.vulkan.v1";
     d.op        = GGML_OP_CUSTOM;
     d.custom_op = sd_ggml_convrot_op();
@@ -992,6 +1133,9 @@ void sd_ggml_register_vulkan_i8(ggml_backend_dev_t device) {
     GGML_ASSERT(ggml_ext_register_kernel(device, &d));
     d.name     = "sd.quantize_i8_convrot.h64.vulkan.v1";
     d.supports = quant64_supports;
+    GGML_ASSERT(ggml_ext_register_kernel(device, &d));
+    d.name     = "sd.quantize_i8_rowwise.vulkan.v1";
+    d.supports = quant1_supports;
     GGML_ASSERT(ggml_ext_register_kernel(device, &d));
     d.name      = "sd.linear_w4_convrot.vulkan.v1";
     d.custom_op = sd_ggml_w4_op();

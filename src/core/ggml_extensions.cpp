@@ -252,6 +252,26 @@ static bool i8_infer(ggml_tensor* const* inputs, int count, const void* attribut
     return true;
 }
 
+static bool requantize_i8_infer(ggml_tensor* const* inputs, int count, const void*, ggml_ext_tensor_desc* output) {
+    if (count != 2 || !inputs[0] || !inputs[1] || inputs[1]->type != GGML_TYPE_I8)
+        return false;
+    const auto* weight = inputs[0];
+    const auto block   = sd_ggml_requantize_i8_block(weight->type);
+    if (!block.bytes || ggml_blck_size(weight->type) != block.size || ggml_type_size(weight->type) != block.bytes)
+        return false;
+    const int64_t k = weight->ne[0], n = weight->ne[1];
+    constexpr int64_t scale_bytes = sizeof(float);
+    int group;
+    if (!sd_ggml_convrot_describe(inputs[1], &group) || group != 256 || k % group ||
+        weight->ne[2] != 1 || weight->ne[3] != 1 || !ggml_is_contiguous(weight) ||
+        k <= 0 || k > i8_size_limit - scale_bytes || n <= 0 || inputs[1]->ne[0] != k || n > i8_size_limit / (k + scale_bytes))
+        return false;
+    output->type  = GGML_TYPE_I8;
+    output->ne[0] = (k + scale_bytes) * n;
+    output->ne[1] = output->ne[2] = output->ne[3] = 1;
+    return true;
+}
+
 static bool convrot_infer(ggml_tensor* const* inputs, int count, const void* attributes, ggml_ext_tensor_desc* output) {
     int32_t group;
     std::memcpy(&group, attributes, sizeof(group));
@@ -270,6 +290,16 @@ static bool convrot_infer(ggml_tensor* const* inputs, int count, const void* att
 
 ggml_ext_op_t sd_ggml_i8_op() {
     static const auto op = [] { ggml_ext_op_desc d = {GGML_EXT_ABI_VERSION, "sd.linear_i8.v1", sizeof(SDI8Attributes), i8_infer}; auto result = ggml_ext_register_op(&d); GGML_ASSERT(result); return result; }();
+    return op;
+}
+
+ggml_ext_op_t sd_ggml_requantize_i8_op() {
+    static const auto op = [] {
+        const ggml_ext_op_desc desc = {GGML_EXT_ABI_VERSION, "sd.requantize_i8.v1", 0, requantize_i8_infer};
+        const auto result           = ggml_ext_register_op(&desc);
+        GGML_ASSERT(result);
+        return result;
+    }();
     return op;
 }
 
